@@ -106,14 +106,18 @@ always skipped.
   walk never descends into it — you cannot re-include a file whose parent
   directory is excluded. Negate the directory itself if you need its
   contents.
-- **Across layers**: a `.cbmignore` negation overrides the **git global
-  excludes** layer and can also un-skip ordinary built-in skip directories.
+- **Across layers**: a `.cbmignore` negation overrides the **repo
+  `.gitignore`/`info/exclude`**, nested `.gitignore` files and the **git
+  global excludes** layers, and can also un-skip ordinary built-in skip
+  directories. `.cbmignore` is the last-word layer: gitignore semantics
+  (last matching pattern wins) are now applied across all ignore files.
   Example: your `~/.config/git/ignore` ignores `*.sql`, but this project's
-  SQL should be indexed — add `!*.sql` to `.cbmignore`. Negation still cannot
-  override the safety core built-in dirs (`.git`, `node_modules`,
-  `.worktrees`, `.claude-worktrees`), the repo `.gitignore`/`info/exclude`,
-  nested `.gitignore` files, the built-in suffix/filename filters, or the
-  size cap.
+  SQL should be indexed — add `!*.sql` to `.cbmignore`. A monorepo whose
+  root `.gitignore` ignores a checkout directory (e.g. AzerothCore's
+  `/modules/*`) is re-included with `!/modules/` plus `!/modules/**`.
+  Negation still cannot override the safety core built-in dirs (`.git`,
+  `node_modules`, `.worktrees`, `.claude-worktrees`), the built-in
+  suffix/filename filters, or the size cap.
 
 ### Planned follow-up
 

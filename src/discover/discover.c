@@ -771,7 +771,15 @@ static bool should_skip_directory(const char *entry_name, const char *rel_path,
         }
     }
     if (gitignore_chain_result(ignore_chain, rel_path, true) > 0) {
-        return true;
+        /* A .cbmignore negation is an explicit project decision, so let it
+         * rescue paths from the repo/nested .gitignore layers too (e.g.
+         * AzerothCore's root .gitignore ignores everything under its modules
+         * directory while the module checkouts are the code we want indexed).
+         * Only the safety-core built-ins stay non-negatable. */
+        bool rescued = cbmignore && cbm_gitignore_match_result(cbmignore, rel_path, true) < 0;
+        if (!rescued) {
+            return true;
+        }
     }
     bool global_ignored = global_gi && cbm_gitignore_matches(global_gi, rel_path, true);
     if (cbmignore) {
@@ -807,7 +815,10 @@ static const char *file_skip_reason(const char *entry_name, const char *rel_path
         return "fast-pattern";
     }
     if (gitignore_chain_result(ignore_chain, rel_path, false) > 0) {
-        return "gitignore";
+        bool rescued = cbmignore && cbm_gitignore_match_result(cbmignore, rel_path, false) < 0;
+        if (!rescued) {
+            return "gitignore";
+        }
     }
     bool global_ignored = global_gi && cbm_gitignore_matches(global_gi, rel_path, false);
     if (cbmignore) {
