@@ -744,6 +744,15 @@ static int resolve_single_call(cbm_pipeline_ctx_t *ctx, CBMCall *call, const CBM
         res = cbm_registry_resolve(ctx->registry, call->callee_name, module_qn, imp_keys, imp_vals,
                                    imp_count);
     }
+    /* Arity-disambiguation fallback (last resort, C family only). The ordinary
+     * chain has just failed; when the leaf names several project callables and
+     * exactly one carries this call's argument count, that shape is the
+     * strongest evidence left. MUST match pass_parallel.c exactly — a fallback
+     * wired into one resolver only would make seq/parallel output diverge. */
+    if ((!res.qualified_name || !res.qualified_name[0]) && !rust_external &&
+        cbm_pipeline_arity_fallback_lang(lang)) {
+        res = cbm_registry_resolve_arity(ctx->registry, call->callee_name, call->arg_count);
+    }
     if (!res.qualified_name || res.qualified_name[0] == '\0') {
         /* Resolution is empty when the callee belongs to an EXTERNAL client
          * library whose source is not in the indexed tree (e.g. `requests.get`,

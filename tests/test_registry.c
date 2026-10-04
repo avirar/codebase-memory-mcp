@@ -472,6 +472,118 @@ TEST(resolve_unique_name) {
     PASS();
 }
 
+/* C++/PHP pointer-member callees ("lootTemplate->CollectItemIds") carry the
+ * receiver in the callee text. The by-name ledger is keyed by the trailing
+ * leaf, so '->' must count as a separator exactly like '.' and '::'. Before
+ * this, the whole raw expression was looked up, matched no bucket, and every
+ * single-hop arrow call whose receiver type the C++ LSP could not resolve was
+ * dropped (mod-playerbots -> core LootTemplate::CollectItemIds had 0 inbound
+ * CALLS edges on the live AzerothCore graph). */
+TEST(resolve_arrow_leaf_unique) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "CollectItemIds",
+                     "proj.src.server.game.Loot.LootMgr.LootTemplate.CollectItemIds", "Method");
+
+    cbm_resolution_t res = cbm_registry_resolve(r, "lootTemplate->CollectItemIds",
+                                                "proj.modules.mod-playerbots", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name,
+                  "proj.src.server.game.Loot.LootMgr.LootTemplate.CollectItemIds");
+    ASSERT_STR_EQ(res.strategy, "unique_name");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Chained arrows: the rightmost separator decides the leaf. */
+TEST(resolve_arrow_leaf_nested) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "CollectItemIds", "proj.game.Loot.LootTemplate.CollectItemIds", "Method");
+
+    cbm_resolution_t res =
+        cbm_registry_resolve(r, "holder->lootTemplate->CollectItemIds", "proj.mod", NULL, NULL, 0);
+    ASSERT_STR_EQ(res.qualified_name, "proj.game.Loot.LootTemplate.CollectItemIds");
+    ASSERT_STR_EQ(res.strategy, "unique_name");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The receiver-chain guard (#1893) must judge arrow receivers too: a foreign
+ * root is refused, while the project's own type in the chain admits. */
+TEST(resolve_arrow_receiver_chain_guard) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add(r, "startOfDayUTC", "AuthDTOs.Calendar.startOfDayUTC", "Method");
+
+    cbm_resolution_t refused = cbm_registry_resolve(
+        r, "URLSession->shared.startOfDayUTC", "HomeboxUI.Stats", NULL, NULL, 0);
+    ASSERT_NULL(refused.qualified_name);
+
+    cbm_resolution_t admitted = cbm_registry_resolve(
+        r, "Calendar->utcGregorian.startOfDayUTC", "HomeboxUI.Stats", NULL, NULL, 0);
+    ASSERT_STR_EQ(admitted.qualified_name, "AuthDTOs.Calendar.startOfDayUTC");
+    ASSERT_STR_EQ(admitted.strategy, "unique_name");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Arity disambiguation: the leaf alone is ambiguous, exactly one candidate's
+ * parameter count matches the call site's argument count. This is the
+ * last-resort path for shapes like `ptr->Execute()` where several project
+ * classes define Execute with different signatures. */
+TEST(resolve_arity_unique_name) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_fn(r, "Collect", "proj.a.Collect", "Method", 1);
+    cbm_registry_add_fn(r, "Collect", "proj.b.Collect", "Method", 2);
+
+    cbm_resolution_t one = cbm_registry_resolve_arity(r, "loot->Collect", 1);
+    ASSERT_STR_EQ(one.qualified_name, "proj.a.Collect");
+    ASSERT_STR_EQ(one.strategy, "arity_unique_name");
+
+    cbm_resolution_t two = cbm_registry_resolve_arity(r, "loot->Collect", 2);
+    ASSERT_STR_EQ(two.qualified_name, "proj.b.Collect");
+    ASSERT_STR_EQ(two.strategy, "arity_unique_name");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* Conservatism is the feature: two arity matches stay ambiguous, a missing
+ * arity stays unresolved, and a registration without a count never
+ * participates. */
+TEST(resolve_arity_ambiguous_or_unknown) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_fn(r, "Collect", "proj.a.Collect", "Method", 1);
+    cbm_registry_add_fn(r, "Collect", "proj.b.Collect", "Method", 1);
+    ASSERT_NULL(cbm_registry_resolve_arity(r, "loot->Collect", 1).qualified_name);
+
+    /* No candidate has this arity. */
+    ASSERT_NULL(cbm_registry_resolve_arity(r, "loot->Collect", 3).qualified_name);
+
+    /* Legacy registration leaves the count unknown (-1): it never matches. */
+    cbm_registry_add(r, "Unique", "proj.c.Unique", "Method");
+    ASSERT_NULL(cbm_registry_resolve_arity(r, "loot->Unique", 0).qualified_name);
+
+    cbm_registry_free(r);
+    PASS();
+}
+
+/* The receiver-chain guard gates arity matches the same way it gates
+ * unique_name: a foreign root stays refused, the project's own type admits. */
+TEST(resolve_arity_respects_receiver_chain_guard) {
+    cbm_registry_t *r = cbm_registry_new();
+    cbm_registry_add_fn(r, "startOfDayUTC", "AuthDTOs.Calendar.startOfDayUTC", "Method", 0);
+
+    ASSERT_NULL(
+        cbm_registry_resolve_arity(r, "URLSession->shared.startOfDayUTC", 0).qualified_name);
+    ASSERT_STR_EQ(cbm_registry_resolve_arity(r, "Calendar->utcGregorian.startOfDayUTC", 0)
+                      .qualified_name,
+                  "AuthDTOs.Calendar.startOfDayUTC");
+
+    cbm_registry_free(r);
+    PASS();
+}
+
 TEST(resolve_unresolved) {
     cbm_registry_t *r = cbm_registry_new();
     cbm_registry_add(r, "foo", "proj.pkg.foo", "Function");
@@ -891,6 +1003,13 @@ TEST(cross_language_config_caller_drops_unique_name_too) {
     /* Receiver-aware strategies are never this guard's business. */
     ASSERT_FALSE(
         cbm_suppress_cross_language_suffix_match(CBM_LANG_MAKEFILE, "src/main.c", "same_module"));
+    /* arity_unique_name is a name guess narrowed by call shape, so it crosses
+     * a language boundary under the same ban as suffix_match; a same-language
+     * target stays admitted. */
+    ASSERT_TRUE(cbm_suppress_cross_language_suffix_match(CBM_LANG_CPP, "scripts/deploy.py",
+                                                         "arity_unique_name"));
+    ASSERT_FALSE(cbm_suppress_cross_language_suffix_match(CBM_LANG_CPP, "src/game/LootMgr.cpp",
+                                                          "arity_unique_name"));
     PASS();
 }
 
@@ -1326,6 +1445,12 @@ SUITE(registry) {
     RUN_TEST(resolve_import_map_aliased_from_import);
     RUN_TEST(resolve_import_map_alias_with_suffix_hits_method);
     RUN_TEST(resolve_unique_name);
+    RUN_TEST(resolve_arrow_leaf_unique);
+    RUN_TEST(resolve_arrow_leaf_nested);
+    RUN_TEST(resolve_arrow_receiver_chain_guard);
+    RUN_TEST(resolve_arity_unique_name);
+    RUN_TEST(resolve_arity_ambiguous_or_unknown);
+    RUN_TEST(resolve_arity_respects_receiver_chain_guard);
     RUN_TEST(resolve_unresolved);
     RUN_TEST(resolve_many_nodes);
     /* Confidence band */

@@ -1032,6 +1032,28 @@ static bool incr_label_is_registry_symbol(const char *label) {
     return cbm_label_is_registry_symbol(label);
 }
 
+/* Extract "param_count":N from a stored node's properties. Returns -1 when
+ * absent or unparseable. Called only for Function/Method labels, whose props
+ * are written by build_def_props with the key present — this is what keeps an
+ * incremental registry's arity evidence identical to a full reindex's. */
+static int incr_node_param_count(const cbm_gbuf_node_t *node) {
+    static const char key[] = "\"param_count\":";
+    if (!node || !node->properties_json) {
+        return -1;
+    }
+    const char *p = strstr(node->properties_json, key);
+    if (!p) {
+        return -1;
+    }
+    p += sizeof(key) - SKIP_ONE;
+    char *end = NULL;
+    long v = strtol(p, &end, 10);
+    if (end == p || v < 0 || v > 100000) {
+        return -1;
+    }
+    return (int)v;
+}
+
 /* Callback for cbm_gbuf_foreach_node: seed the registry with the existing
  * project's definition symbols so the resolver can match cross-file symbols
  * during incremental. Mirrors the full-index registry contents exactly so an
@@ -1041,7 +1063,11 @@ static void registry_visitor(const cbm_gbuf_node_t *node, void *userdata) {
     if (!incr_label_is_registry_symbol(node->label)) {
         return;
     }
-    cbm_registry_add(r, node->name, node->qualified_name, node->label);
+    int param_count = node->label && (strcmp(node->label, "Function") == 0 ||
+                                      strcmp(node->label, "Method") == 0)
+                          ? incr_node_param_count(node)
+                          : -1;
+    cbm_registry_add_fn(r, node->name, node->qualified_name, node->label, param_count);
 }
 
 static void free_incremental_result_cache(CBMFileResult **cache, int count) {

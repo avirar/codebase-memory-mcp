@@ -62,6 +62,11 @@ const char *cbm_confidence_band(double score) {
 #define CONF_SAME_MODULE 0.90
 /* Strategy 3: unique_name — only one candidate project-wide */
 #define CONF_UNIQUE_NAME 0.75
+/* Arity disambiguation: several same-name candidates, exactly one of which
+ * has a parameter count equal to the call's argument count. Weaker than
+ * unique_name (the leaf alone was ambiguous) but stronger than suffix_match
+ * (the arity is positive evidence, not import distance). */
+#define CONF_ARITY_UNIQUE_NAME 0.60
 /* Strategy 4: suffix_match — multiple candidates, filtered */
 #define CONF_SUFFIX_MATCH 0.55
 /* Fuzzy fallback: lower confidence */
@@ -83,6 +88,12 @@ typedef struct {
     int cap;
     uint8_t *is_test; /* is_test_qn(items[i]), one byte per entry */
     int is_test_cap;
+    /* Registration-time parameter count for callables (Function/Method), or
+     * -1 when unknown (non-callables and the legacy 4-arg add). Parallel to
+     * items; entries at index >= param_count_cap are unknown. Only the
+     * arity-disambiguation fallback reads it. */
+    int *param_counts;
+    int param_count_cap;
 } qn_array_t;
 
 struct cbm_registry {
@@ -101,9 +112,12 @@ struct cbm_registry {
 /* ── Helpers ─────────────────────────────────────────────────────── */
 
 /* Extract the last path segment from a QN. Returns pointer into s.
- * Recognizes both '.' (most langs) and Rust/C++ '::' separators, so a
- * scoped callee like "lib::square" yields "square" rather than the whole
- * scoped path (which never matches the by-name index). */
+ * Recognizes '.', Rust/C++ '::' and C++/PHP '->' separators, so a scoped
+ * callee like "lib::square" yields "square" and a pointer-member callee like
+ * "lootTemplate->CollectItemIds" yields "CollectItemIds" rather than the whole
+ * expression (which never matches the by-name index). Without '->' every
+ * single-hop arrow call whose receiver type the language LSP could not resolve
+ * fell through to a by-name lookup of the raw expression and was dropped. */
 static const char *simple_name(const char *qn) {
     const char *dot = strrchr(qn, '.');
     const char *seg = dot ? dot + SKIP_ONE : qn;
@@ -115,6 +129,16 @@ static const char *simple_name(const char *qn) {
     }
     if (colons && colons + 2 > seg) {
         seg = colons + 2;
+    }
+    /* Same rule for the pointer-member arrow: take the segment after the last
+     * "->" when it is the rightmost separator. '->' is two bytes, matching the
+     * "::" handling above; a later '.' or "::" always wins. */
+    const char *arrows = NULL;
+    for (const char *p = qn; (p = strstr(p, "->")) != NULL; p += 2) {
+        arrows = p;
+    }
+    if (arrows && arrows + 2 > seg) {
+        seg = arrows + 2;
     }
     return seg;
 }
@@ -751,15 +775,17 @@ bool cbm_suppress_cross_language_suffix_match(CBMLanguage caller_lang, const cha
                                               const char *strategy) {
     /* Two same-named symbols in different languages: suffix_match picks one
      * winner by import-distance and attaches every bare-name call to it
-     * (#725, Bash/Python main, JS/Python commit). unique_name is the
-     * candidates==1 case (#1572) and is not this guard — except for a build
-     * or configuration caller, where even a unique match into another
-     * language is a collision by construction. */
+     * (#725, Bash/Python main, JS/Python commit). arity_unique_name is the
+     * same class of guess (several same-name candidates; only the call shape
+     * narrowed it), so it crosses a language boundary under the same ban.
+     * unique_name is the candidates==1 case (#1572) and is not this guard —
+     * except for a build or configuration caller, where even a unique match
+     * into another language is a collision by construction. */
     if (!strategy) {
         return false;
     }
     bool config_caller = build_config_language(caller_lang);
-    if (strcmp(strategy, "suffix_match") != 0 &&
+    if (strcmp(strategy, "suffix_match") != 0 && strcmp(strategy, "arity_unique_name") != 0 &&
         !(config_caller && strcmp(strategy, "unique_name") == 0)) {
         return false;
     }
@@ -851,6 +877,7 @@ static void free_qn_array(const char *key, void *value, void *ud) {
     if (arr) {
         /* items borrow the exact map's keys — freed there, not here */
         cbm_free(CBM_MEM_CLASS_DYN_ARRAY, arr->is_test);
+        cbm_free(CBM_MEM_CLASS_DYN_ARRAY, arr->param_counts);
         cbm_da_free(arr);
         free(arr);
     }
@@ -875,11 +902,15 @@ void cbm_registry_free(cbm_registry_t *r) {
 /* ── Registration ────────────────────────────────────────────────── */
 
 /* Record `owned_qn` in the by-name bucket for `key`, keeping the bucket's
- * is_test flags in step with its entries.
+ * is_test flags and parameter counts in step with its entries.
  *
- * No array dedup needed: cbm_registry_add's exact-map check guarantees the QN
- * is new, and it calls this at most once per distinct key. */
-static void index_under_name(cbm_registry_t *r, const char *key, const char *owned_qn) {
+ * `param_count` is the registration-time parameter count for callables, or -1
+ * when unknown; it is only read by cbm_registry_resolve_arity.
+ *
+ * No array dedup needed: cbm_registry_add_fn's exact-map check guarantees the
+ * QN is new, and it calls this at most once per distinct key. */
+static void index_under_name(cbm_registry_t *r, const char *key, const char *owned_qn,
+                             int param_count) {
     qn_array_t *arr = cbm_ht_get(r->by_name, key);
     if (!arr) {
         arr = calloc(CBM_ALLOC_ONE, sizeof(qn_array_t));
@@ -902,10 +933,32 @@ static void index_under_name(cbm_registry_t *r, const char *key, const char *own
     if (arr->count <= arr->is_test_cap) {
         arr->is_test[arr->count - SKIP_ONE] = is_test_qn(owned_qn) ? 1 : 0;
     }
+    if (arr->count > arr->param_count_cap) {
+        int want = arr->cap > 0 ? arr->cap : arr->count;
+        int *grown = cbm_realloc(CBM_MEM_CLASS_DYN_ARRAY, arr->param_counts,
+                                 (size_t)want * sizeof(int));
+        if (grown) {
+            /* A failed earlier grow leaves slots unwritten; seed every new slot
+             * as unknown before the current entry is recorded. */
+            for (int i = arr->param_count_cap; i < want; i++) {
+                grown[i] = -1;
+            }
+            arr->param_counts = grown;
+            arr->param_count_cap = want;
+        }
+    }
+    if (arr->count <= arr->param_count_cap) {
+        arr->param_counts[arr->count - SKIP_ONE] = param_count;
+    }
 }
 
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label) {
+    cbm_registry_add_fn(r, name, qualified_name, label, -1);
+}
+
+void cbm_registry_add_fn(cbm_registry_t *r, const char *name, const char *qualified_name,
+                         const char *label, int param_count) {
     if (!r || !qualified_name || !label) {
         return;
     }
@@ -961,14 +1014,14 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
      * `name` is NULL or empty only for callers that have no symbol name to
      * give; those have the derived key and nothing else. */
     const char *derived = simple_name(qualified_name);
-    index_under_name(r, derived, owned_qn);
+    index_under_name(r, derived, owned_qn, param_count);
     /* '#' is a QN fence, and extract_defs.c's rust_cfg_qualified_name is the
      * only thing in the tree that mints one today. A grammar that starts
      * minting a '#' opts into this second key by doing so, whatever it means by
      * the fence: its symbols become reachable under the passed name as well,
      * and they share that name's bucket with everything else filed under it. */
     if (name && name[0] && strchr(derived, '#') && strcmp(name, derived) != 0) {
-        index_under_name(r, name, owned_qn);
+        index_under_name(r, name, owned_qn, param_count);
     }
 }
 
@@ -1229,12 +1282,18 @@ static const char *qualified_suffix_match(const qn_array_t *arr, const char *cal
  * Language agnostic by design: the registry holds no language, and every
  * language that writes receiver chains gains the same protection. */
 static bool receiver_chain_admits(const char *callee_name, const char *candidate_qn) {
-    /* Normalize "::" -> "." so the chain composes with dotted candidate QNs,
-     * the same way qualified_suffix_match does. */
+    /* Normalize "::" and the pointer-member "->" to "." so the chain composes
+     * with dotted candidate QNs, the same way qualified_suffix_match does.
+     * Arrow receivers must be judged by this guard too: without the mapping a
+     * chain like "URLSession->shared.data" carried a single unmatchable
+     * segment and the guard could not see it was foreign. */
     char dotted[CBM_SZ_512];
     size_t w = 0;
     for (const char *s = callee_name; *s && w + SKIP_ONE < sizeof(dotted);) {
         if (s[0] == ':' && s[1] == ':') {
+            dotted[w++] = '.';
+            s += 2;
+        } else if (s[0] == '-' && s[1] == '>') {
             dotted[w++] = '.';
             s += 2;
         } else {
@@ -1465,6 +1524,50 @@ cbm_resolution_t cbm_registry_resolve_lineage(const cbm_registry_t *r, const cha
      * few distinct relation refs, so the chain walk stays cheap. */
     return registry_resolve_chain(r, callee_name, module_qn, import_map_keys, import_map_vals,
                                   import_map_count);
+}
+
+/* ── Arity disambiguation ───────────────────────────────────────── */
+
+/* Last-resort resolve for a call whose leaf name matches several project
+ * callables and whose existing strategies (import/same-module/unique/suffix)
+ * all failed: keep only candidates whose registered parameter count equals the
+ * call site's argument count, and resolve solely when exactly one remains.
+ *
+ * Deliberately conservative: a single arity match is positive evidence (the
+ * call shape discriminates the overload), but two or more remain ambiguous and
+ * stay unresolved rather than being picked by registration order. Candidates
+ * with an unknown parameter count never participate. Callers gate this to the
+ * C family (see cbm_pipeline_arity_fallback_lang): in dynamically typed
+ * languages a call's argument count is not an arity, so the same evidence
+ * would be noise.
+ *
+ * Uncached on purpose: cbm_registry_resolve's per-file cache is keyed by bare
+ * callee_name, and the same callee text may appear with different argument
+ * counts in one file — sharing an entry would answer the wrong question. */
+cbm_resolution_t cbm_registry_resolve_arity(const cbm_registry_t *r, const char *callee_name,
+                                            int arg_count) {
+    if (!r || !callee_name || arg_count < 0) {
+        return empty_result();
+    }
+    const char *lookup = simple_name(callee_name);
+    qn_array_t *arr = cbm_ht_get(r->by_name, lookup);
+    if (!arr || arr->count == 0 || arr->count > REG_MAX_CANDIDATES) {
+        return empty_result();
+    }
+    const char *match = NULL;
+    for (int i = 0; i < arr->count; i++) {
+        if (!arr->param_counts || i >= arr->param_count_cap || arr->param_counts[i] != arg_count) {
+            continue;
+        }
+        if (match) {
+            return empty_result(); /* two arity matches: still ambiguous */
+        }
+        match = arr->items[i];
+    }
+    if (!match || !receiver_chain_admits(callee_name, match)) {
+        return empty_result();
+    }
+    return (cbm_resolution_t){match, "arity_unique_name", CONF_ARITY_UNIQUE_NAME, 1};
 }
 
 /* ── Fuzzy Resolve ──────────────────────────────────────────────── */

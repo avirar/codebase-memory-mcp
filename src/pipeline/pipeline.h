@@ -239,6 +239,13 @@ void cbm_registry_free(cbm_registry_t *r);
 void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified_name,
                       const char *label);
 
+/* Register a callable together with its parameter count — the evidence the
+ * arity-disambiguation fallback (cbm_registry_resolve_arity) reads. Pass a
+ * negative count for "unknown"; the plain cbm_registry_add above forwards -1.
+ * Only Function/Method registrations should carry a real count. */
+void cbm_registry_add_fn(cbm_registry_t *r, const char *name, const char *qualified_name,
+                         const char *label, int param_count);
+
 /* Resolve a callee name using prioritized strategies.
  * import_map: NULL-terminated array of {local_name, resolved_qn} pairs, or NULL.
  * Returns result with qualified_name="" if unresolved.
@@ -249,6 +256,24 @@ void cbm_registry_add(cbm_registry_t *r, const char *name, const char *qualified
 cbm_resolution_t cbm_registry_resolve(const cbm_registry_t *r, const char *callee_name,
                                       const char *module_qn, const char **import_map_keys,
                                       const char **import_map_vals, int import_map_count);
+
+/* Arity-disambiguation fallback: when the ordinary chain left a multi-candidate
+ * leaf unresolved, resolve it only if exactly one candidate has a parameter
+ * count equal to `arg_count`. Uncached, and candidates with an unknown count
+ * never match. Callers gate to C/C++/CUDA via cbm_pipeline_arity_fallback_lang
+ * (only there is a call's argument count a signature property); see registry.c
+ * for the full rationale. */
+cbm_resolution_t cbm_registry_resolve_arity(const cbm_registry_t *r, const char *callee_name,
+                                            int arg_count);
+
+/* The arity fallback is only sound where a call's argument count is a fixed
+ * property of the callee's signature: C, C++ and CUDA. In dynamically typed
+ * languages the same count says nothing about which same-named function runs,
+ * so the fallback's evidence would be noise. MUST stay identical in
+ * pass_calls.c and pass_parallel.c. */
+static inline bool cbm_pipeline_arity_fallback_lang(CBMLanguage lang) {
+    return lang == CBM_LANG_C || lang == CBM_LANG_CPP || lang == CBM_LANG_CUDA;
+}
 
 /* Relation-permitting resolve for SQL FROM/JOIN lineage usages ONLY — the one
  * consumer allowed to bind Table/View targets. Uncached (the per-file resolve

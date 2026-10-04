@@ -337,7 +337,15 @@ static void process_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *def, const
      * (SQL FROM/JOIN lineage). pass_parallel.c and pipeline_incremental.c seed
      * through the same predicate, so the three registries cannot diverge. */
     if (node_id > 0 && cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
+        /* Only callables carry a meaningful arity for the fallback resolver;
+         * every other label registers as unknown (-1). Mirrors the parallel
+         * path and the incremental seeder. */
+        int param_count = def->label && (strcmp(def->label, "Function") == 0 ||
+                                         strcmp(def->label, "Method") == 0)
+                              ? def->param_count
+                              : -1;
+        cbm_registry_add_fn(ctx->registry, def->name, def->qualified_name, def->label,
+                            param_count);
     }
     char *file_qn = cbm_pipeline_fqn_compute(ctx->project_name, rel, "__file__");
     const cbm_gbuf_node_t *file_node = cbm_gbuf_find_by_qn(ctx->gbuf, file_qn);

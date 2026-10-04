@@ -1675,7 +1675,15 @@ static int register_and_link_def(cbm_pipeline_ctx_t *ctx, const CBMDefinition *d
     /* Registry membership is defined ONCE by cbm_label_is_registry_symbol
      * (helpers.c) — see pass_definitions.c for the per-label rationale. */
     if (cbm_label_is_registry_symbol(def->label)) {
-        cbm_registry_add(ctx->registry, def->name, def->qualified_name, def->label);
+        /* Callables register with their arity for the fallback resolver;
+         * containers and variables stay unknown. Same gate as
+         * pass_definitions.c. */
+        int param_count = def->label && (strcmp(def->label, "Function") == 0 ||
+                                         strcmp(def->label, "Method") == 0)
+                              ? def->param_count
+                              : -1;
+        cbm_registry_add_fn(ctx->registry, def->name, def->qualified_name, def->label,
+                            param_count);
         (*reg_entries)++;
     }
     const cbm_gbuf_node_t *def_node = cbm_gbuf_find_by_qn(ctx->gbuf, def->qualified_name);
@@ -2993,6 +3001,14 @@ static void resolve_file_calls(resolve_ctx_t *rc, resolve_worker_state_t *ws, CB
             !rust_external) {
             res = cbm_registry_resolve(rc->registry, call->callee_name, module_qn, imp_keys,
                                        imp_vals, imp_count);
+        }
+        /* Arity-disambiguation fallback: identical condition and evidence as
+         * pass_calls.c — see the comment there. Synthetic LSP-guarded
+         * candidates stay fail-closed (they continue below). */
+        if ((!res.qualified_name || !res.qualified_name[0]) &&
+            !call->requires_lsp_resolution && !rust_external &&
+            cbm_pipeline_arity_fallback_lang(lang)) {
+            res = cbm_registry_resolve_arity(rc->registry, call->callee_name, call->arg_count);
         }
         atomic_fetch_add_explicit(&rc->time_ns_rc_resolve, extract_now_ns() - _rc_t0,
                                   memory_order_relaxed);
