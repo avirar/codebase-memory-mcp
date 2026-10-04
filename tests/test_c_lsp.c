@@ -107,6 +107,77 @@ TEST(clsp_pointer_arrow) {
     PASS();
 }
 
+/* The mod-playerbots shape: an explicit `Type const*` local initialized from a
+ * factory call, then a member call through the arrow. The receiver type comes
+ * from the declaration itself (not the initializer's return type), so the
+ * cross-file registry only has to supply the method table. */
+TEST(clsp_const_pointer_local_member_call) {
+    CBMFileResult *r = extract_cpp("\n"
+                                   "class LootTemplate {\n"
+                                   "public:\n"
+                                   "    void CollectItemIds(int id) { (void)id; }\n"
+                                   "};\n"
+                                   "LootTemplate const* GetLootFor(int id);\n"
+                                   "void f(int id) {\n"
+                                   "    LootTemplate const* lootTemplate = GetLootFor(id);\n"
+                                   "    lootTemplate->CollectItemIds(id);\n"
+                                   "}\n"
+                                   "");
+    ASSERT_NOT_NULL(r);
+    ASSERT_GTE(find_resolved(r, "f", "CollectItemIds"), 0);
+    cbm_free_result(r);
+    PASS();
+}
+
+/* Same shape with the class absent from the translation unit: the Tier-2
+ * cross registry (built once from all project defs) carries LootTemplate's
+ * method table, and the walk must bind through the declared local type. */
+TEST(clsp_const_pointer_local_member_call_cross_registry) {
+    CBMArena arena;
+    cbm_arena_init(&arena);
+    static const char *params[] = {"int", NULL};
+    CBMLSPDef defs[2];
+    memset(defs, 0, sizeof(defs));
+    defs[0].qualified_name = "test.mod.LootTemplate";
+    defs[0].short_name = "LootTemplate";
+    defs[0].label = "Class";
+    defs[0].def_module_qn = "test.mod";
+    defs[0].lang = CBM_LANG_CPP;
+    defs[1].qualified_name = "test.mod.LootTemplate.CollectItemIds";
+    defs[1].short_name = "CollectItemIds";
+    defs[1].label = "Method";
+    defs[1].receiver_type = "test.mod.LootTemplate";
+    defs[1].def_module_qn = "test.mod";
+    defs[1].lang = CBM_LANG_CPP;
+    defs[1].signature_param_types = params;
+    defs[1].signature_param_count = 1;
+
+    CBMTypeRegistry *reg = cbm_c_build_cross_registry(&arena, defs, 2);
+    ASSERT_NOT_NULL(reg);
+
+    const char *src = "class LootTemplate;\n"
+                      "LootTemplate const* GetLootFor(int id);\n"
+                      "void f(int id) {\n"
+                      "    LootTemplate const* lootTemplate = GetLootFor(id);\n"
+                      "    lootTemplate->CollectItemIds(id);\n"
+                      "}\n";
+    CBMResolvedCallArray out = {0};
+    cbm_run_c_lsp_cross_with_registry(&arena, src, (int)strlen(src), "test.mod",
+                                      /*cpp_mode=*/true, reg, /*include_paths=*/NULL,
+                                      /*include_ns_qns=*/NULL, /*include_count=*/0,
+                                      /*cached_tree=*/NULL, &out);
+    int found = -1;
+    for (int i = 0; i < out.count; i++) {
+        if (out.items[i].callee_qn && strstr(out.items[i].callee_qn, "CollectItemIds")) {
+            found = i;
+        }
+    }
+    ASSERT_GTE(found, 0);
+    ASSERT_STR_NEQ(out.items[found].strategy, "lsp_unresolved");
+    cbm_arena_destroy(&arena);
+    PASS();
+}
+
 TEST(clsp_dot_access) {
     CBMFileResult *r = extract_cpp("\n"
                                    "class Foo {\n"
@@ -16408,6 +16479,8 @@ SUITE(c_lsp) {
     RUN_TEST(registry_short_name_indexes);
     RUN_TEST(clsp_simple_var_decl);
     RUN_TEST(clsp_pointer_arrow);
+    RUN_TEST(clsp_const_pointer_local_member_call);
+    RUN_TEST(clsp_const_pointer_local_member_call_cross_registry);
     RUN_TEST(clsp_dot_access);
     RUN_TEST(clsp_auto_inference);
     RUN_TEST(clsp_namespace_qualified);
