@@ -857,7 +857,7 @@ PP_OBJ_TSAN = $(BUILD_DIR)/tsan_preprocessor.o
 
 # ── Targets ──────────────────────────────────────────────────────
 
-.PHONY: test test-par test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-tidy-diff lint-cppcheck lint-format security fuzz
+.PHONY: test test-par test-obj test-repro test-foundation test-tsan test-daemon-smoke cbm cbm-with-ui frontend embed clean-c lint lint-tidy lint-tidy-diff lint-cppcheck lint-format security fuzz
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -1042,6 +1042,31 @@ test-focused: $(BUILD_DIR)/test-runner
 	@test -n "$(strip $(TEST_SUITES))" || \
 		(echo "TEST_SUITES is required for test-focused"; exit 2)
 	cd $(CURDIR) && $(BUILD_DIR)/test-runner $(TEST_SUITES)
+
+# ── Iteration-only per-object test runner ────────────────────────
+# The canonical $(BUILD_DIR)/test-runner recipe compiles every test and
+# production source in ONE compiler invocation. A multi-source command without
+# -c is a link-shaped invocation, which no compiler cache can cache, so every
+# edit recompiles the whole suite serially. This target compiles the SAME
+# sources with the SAME flags as individual objects, so ccache only redoes the
+# edited translation units and -j parallelizes. The canonical `test` target and
+# scripts/test.sh stay untouched and authoritative.
+TEST_OBJ_DIR = $(BUILD_DIR)/test_obj
+TEST_OBJ_SRCS = $(ALL_TEST_SRCS) $(PROD_SRCS) $(EXTRACTION_SRCS) $(AC_LZ4_SRCS) \
+                $(ZSTD_SRCS) $(SQLITE_WRITER_SRC)
+TEST_OBJ_OBJS = $(patsubst %.c,$(TEST_OBJ_DIR)/%.o,$(TEST_OBJ_SRCS))
+
+$(TEST_OBJ_DIR)/%.o: %.c $(PROJECT_HDRS) | $(BUILD_DIR)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -c -o $@ $<
+
+$(BUILD_DIR)/test-runner-obj: $(TEST_OBJ_OBJS) $(OBJS_VENDORED_TEST)
+	$(CC) $(CFLAGS_TEST) -Itests -Itests/repro -o $@ $(TEST_OBJ_OBJS) $(OBJS_VENDORED_TEST) $(LDFLAGS_TEST)
+
+test-obj: $(BUILD_DIR)/test-runner-obj
+	@test -n "$(strip $(TEST_SUITES))" || \
+		(echo "TEST_SUITES is required for test-obj"; exit 2)
+	cd $(CURDIR) && $(BUILD_DIR)/test-runner-obj $(TEST_SUITES)
 
 # ── Cumulative bug-reproduction runner (RED board by design, non-gating) ──
 # Mirrors test-runner's link line but uses repro_main.c (own main + counters)
