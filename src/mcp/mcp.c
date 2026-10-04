@@ -16193,8 +16193,8 @@ static bool detect_snapshot_add_changed_file(cbm_mcp_server_t *srv, cbm_sha256_c
 
 static bool detect_snapshot_fingerprint(cbm_mcp_server_t *srv, const char *root_path,
                                         const char *head_oid, const char *base_oid,
-                                        const char *merge_base, const char *generation,
-                                        char **files, int file_count,
+                                        const char *merge_base, const char *extra_revisions,
+                                        const char *generation, char **files, int file_count,
                                         const cbm_traverse_result_t *impact,
                                         const detect_module_row_t *modules, int module_count,
                                         int module_overflow, char out[33]) {
@@ -16204,6 +16204,12 @@ static bool detect_snapshot_fingerprint(cbm_mcp_server_t *srv, const char *root_
     detect_snapshot_add_field(&hash, head_oid);
     detect_snapshot_add_field(&hash, base_oid);
     detect_snapshot_add_field(&hash, merge_base);
+    /* Nested repositories contribute their own head/merge-base: a cursor minted
+     * before a module repo moved must be rejected, not replayed against the new
+     * revision set with silently different changed paths. */
+    if (extra_revisions && extra_revisions[0]) {
+        detect_snapshot_add_field(&hash, extra_revisions);
+    }
     detect_snapshot_add_field(&hash, generation);
     bool complete = true;
     for (int i = 0; i < file_count; i++) {
@@ -16241,6 +16247,435 @@ static bool detect_snapshot_fingerprint(cbm_mcp_server_t *srv, const char *root_
     }
     out[32] = '\0';
     return complete;
+}
+
+/* ── Nested repository support (detect_changes) ────────────────────
+ *
+ * The index records one Branch node per nested repository (a subdirectory
+ * carrying its own .git that discovery walked into), with `"nested":true` and
+ * `"repo_rel":"<path>"` in its properties. Change detection unions those
+ * repositories with the primary one, so a gitignored-then-rescued module
+ * (AzerothCore's modules/mod-playerbots) lands in a single call instead of
+ * requiring a second project index. */
+
+typedef struct {
+    char *rel;        /* project-relative repo root */
+    char *abs;        /* absolute repo root */
+    char *head;       /* resolved HEAD oid when collected */
+    char *merge_base; /* resolved merge-base when collected */
+    bool included;    /* false when skipped; `warning` says why */
+    char *warning;
+} detect_nested_repo_t;
+
+/* Extract a JSON string field from a flat properties blob. Minimal scanner:
+ * the store writes these blobs itself, keys are unescaped, values were
+ * cbm_json_escape'd. Returns false when absent or malformed. */
+static bool detect_prop_string(const char *json, const char *key, char *out, size_t out_sz) {
+    if (!json || !key || !out || out_sz == 0) {
+        return false;
+    }
+    char needle[CBM_SZ_128];
+    int n = snprintf(needle, sizeof(needle), "\"%s\":", key);
+    if (n <= 0 || n >= (int)sizeof(needle)) {
+        return false;
+    }
+    const char *p = strstr(json, needle);
+    if (!p) {
+        return false;
+    }
+    p += (size_t)n;
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p != '"') {
+        return false;
+    }
+    p++;
+    size_t w = 0;
+    while (*p && *p != '"' && w + 1U < out_sz) {
+        if (*p == '\\' && p[1]) {
+            p++; /* keep the escaped byte as-is */
+        }
+        out[w++] = *p++;
+    }
+    out[w] = '\0';
+    return w > 0;
+}
+
+static void detect_nested_repos_free(detect_nested_repo_t *repos, int count) {
+    if (!repos) {
+        return;
+    }
+    for (int i = 0; i < count; i++) {
+        free(repos[i].rel);
+        free(repos[i].abs);
+        free(repos[i].head);
+        free(repos[i].merge_base);
+        free(repos[i].warning);
+    }
+    free(repos);
+}
+
+static detect_nested_repo_t *detect_load_nested_repos(cbm_store_t *store, const char *project,
+                                                      const char *root_path, int *count_out) {
+    *count_out = 0;
+    cbm_node_t *nodes = NULL;
+    int node_count = 0;
+    int frc = cbm_store_find_nodes_by_label(store, project, "Branch", &nodes, &node_count);
+    if (frc != CBM_STORE_OK || node_count <= 0 || !nodes) {
+        /* An empty result still owns its backing array. */
+        cbm_store_free_nodes(nodes, node_count > 0 ? node_count : 0);
+        return NULL;
+    }
+    detect_nested_repo_t *repos = calloc((size_t)node_count, sizeof(*repos));
+    if (!repos) {
+        cbm_store_free_nodes(nodes, node_count);
+        return NULL;
+    }
+    int n = 0;
+    for (int i = 0; i < node_count; i++) {
+        const char *props = nodes[i].properties_json;
+        if (!props || !strstr(props, "\"nested\":true")) {
+            continue;
+        }
+        char rel[CBM_SZ_1K];
+        if (!detect_prop_string(props, "repo_rel", rel, sizeof(rel)) || !rel[0]) {
+            continue;
+        }
+        size_t need = strlen(root_path) + strlen(rel) + 2U;
+        char *abs = malloc(need);
+        char *rel_copy = strdup(rel);
+        if (!abs || !rel_copy) {
+            free(abs);
+            free(rel_copy);
+            break;
+        }
+        snprintf(abs, need, "%s/%s", root_path, rel);
+        repos[n].rel = rel_copy;
+        repos[n].abs = abs;
+        n++;
+    }
+    cbm_store_free_nodes(nodes, node_count);
+    if (n == 0) {
+        free(repos);
+        return NULL;
+    }
+    *count_out = n;
+    return repos;
+}
+
+/* Run the detect_changes git sequence in one nested repository, appending
+ * project-relative paths (prefixed with repo->rel) and hunks to the caller's
+ * arrays. Returns 0 on success, 1 when the repo has no usable base (caller
+ * records `warn`), -1 on a hard failure, 2 when the request was cancelled. */
+static int detect_collect_nested_repo(cbm_mcp_server_t *srv, detect_nested_repo_t *repo,
+                                      const char *base_branch, bool want_symbols, char ***files,
+                                      int *file_count, int *file_cap, cbm_changed_hunk_t **hunks,
+                                      int *hunk_count, char *warn, size_t warn_sz) {
+    char head_oid[65] = "";
+    char base_oid[65] = "";
+    char git_prefix[CBM_SZ_4K] = "";
+    bool git_prefix_valid = false;
+    char cmd[CBM_SZ_4K];
+    snprintf(cmd, sizeof(cmd),
+             "git -C '%s' rev-parse 'HEAD^{commit}' '%s^{commit}' --show-prefix 2>/dev/null",
+             repo->abs, base_branch);
+    char out_path[CBM_SZ_2K] = {0};
+    cbm_proc_result_t proc = {0};
+    int run = mcp_run_shell_command_cancellable(srv, cmd, out_path, &proc);
+    bool cancelled = proc.cancellation_requested || mcp_request_cancelled(srv);
+    bool oom = false;
+    FILE *fp = (!cancelled && run == 0 && proc.exit_code == 0) ? cbm_fopen(out_path, "rb") : NULL;
+    if (fp) {
+        (void)detect_read_rev_parse_line(fp, &oom, head_oid, sizeof(head_oid),
+                                         detect_valid_object_id);
+        (void)detect_read_rev_parse_line(fp, &oom, base_oid, sizeof(base_oid),
+                                         detect_valid_object_id);
+        git_prefix_valid = detect_read_rev_parse_line(fp, &oom, git_prefix, sizeof(git_prefix),
+                                                      detect_valid_git_prefix);
+        (void)fclose(fp);
+    }
+    if (out_path[0]) {
+        (void)cbm_unlink(out_path);
+    }
+    if (cancelled) {
+        return 2;
+    }
+    if (run != 0 || proc.exit_code != 0 || oom || !head_oid[0] || !base_oid[0] ||
+        !git_prefix_valid) {
+        snprintf(warn, warn_sz, "nested repository %s: base_branch \"%s\" is not resolvable",
+                 repo->rel, base_branch);
+        return 1;
+    }
+
+    char merge_base[65] = "";
+    snprintf(cmd, sizeof(cmd), "git -C '%s' merge-base '%s' '%s' 2>/dev/null", repo->abs, base_oid,
+             head_oid);
+    memset(&proc, 0, sizeof(proc));
+    memset(out_path, 0, sizeof(out_path));
+    run = mcp_run_shell_command_cancellable(srv, cmd, out_path, &proc);
+    cancelled = proc.cancellation_requested || mcp_request_cancelled(srv);
+    oom = false;
+    bool terminated = false;
+    char *mb_record = NULL;
+    fp = (!cancelled && run == 0 && proc.exit_code == 0) ? cbm_fopen(out_path, "rb") : NULL;
+    if (fp) {
+        mb_record = detect_read_record(fp, '\n', &oom, &terminated);
+        (void)fclose(fp);
+    }
+    if (out_path[0]) {
+        (void)cbm_unlink(out_path);
+    }
+    if (mb_record) {
+        size_t len = strlen(mb_record);
+        if (len > 0 && mb_record[len - 1] == '\r') {
+            mb_record[--len] = '\0';
+        }
+        if (detect_valid_object_id(mb_record)) {
+            memcpy(merge_base, mb_record, len + 1U);
+        }
+    }
+    free(mb_record);
+    if (cancelled) {
+        return 2;
+    }
+    if (run != 0 || proc.exit_code != 0 || oom || !merge_base[0]) {
+        snprintf(warn, warn_sz, "nested repository %s: no common ancestor with base_branch \"%s\"",
+                 repo->rel, base_branch);
+        return 1;
+    }
+
+    char **lfiles = NULL;
+    int lcount = 0;
+    int lcap = 0;
+    bool path_oom = false;
+    bool path_malformed = false;
+
+    /* diff: committed changes (base...head) + uncommitted worktree changes. */
+    char diff_cmd[CBM_SZ_4K];
+    snprintf(diff_cmd, sizeof(diff_cmd),
+             "git -c core.quotePath=false -C '%s' diff --name-only -z '%s' '%s' -- 2>/dev/null "
+             "&& git -c core.quotePath=false -C '%s' diff --name-only -z -- 2>/dev/null",
+             repo->abs, merge_base, head_oid, repo->abs);
+    memset(&proc, 0, sizeof(proc));
+    memset(out_path, 0, sizeof(out_path));
+    run = mcp_run_shell_command_cancellable(srv, diff_cmd, out_path, &proc);
+    cancelled = proc.cancellation_requested || mcp_request_cancelled(srv);
+    bool opened = false;
+    fp = (!cancelled && run == 0 && proc.exit_code == 0) ? cbm_fopen(out_path, "rb") : NULL;
+    opened = fp != NULL;
+    if (fp) {
+        for (;;) {
+            bool rec_terminated = false;
+            char *record = detect_read_record(fp, '\0', &path_oom, &rec_terminated);
+            if (!record) {
+                break;
+            }
+            if (!rec_terminated) {
+                path_malformed = true;
+                free(record);
+                break;
+            }
+            const char *rel = detect_project_relative_path(record, git_prefix);
+            if (rel && rel[0]) {
+                char prefixed[CBM_SZ_1K];
+                const char *final_path = rel;
+                if (repo->rel[0]) {
+                    int pn = snprintf(prefixed, sizeof(prefixed), "%s/%s", repo->rel, rel);
+                    if (pn > 0 && pn < (int)sizeof(prefixed)) {
+                        final_path = prefixed;
+                    }
+                }
+                if (!detect_add_changed_path(&lfiles, &lcount, &lcap, final_path)) {
+                    path_oom = true;
+                    free(record);
+                    break;
+                }
+            }
+            free(record);
+        }
+        (void)fclose(fp);
+    }
+    if (out_path[0]) {
+        (void)cbm_unlink(out_path);
+    }
+    if (cancelled) {
+        for (int i = 0; i < lcount; i++) {
+            free(lfiles[i]);
+        }
+        free(lfiles);
+        return 2;
+    }
+    if (run != 0 || proc.exit_code != 0 || !opened || path_oom || path_malformed) {
+        for (int i = 0; i < lcount; i++) {
+            free(lfiles[i]);
+        }
+        free(lfiles);
+        return -1;
+    }
+
+    /* status: untracked + staged paths (rename/copy source records consumed). */
+    char status_cmd[CBM_SZ_4K];
+    snprintf(status_cmd, sizeof(status_cmd),
+             "git --no-optional-locks -c core.quotePath=false -C '%s' status --porcelain=v1 -z "
+             "--untracked-files=all -- 2>/dev/null",
+             repo->abs);
+    memset(&proc, 0, sizeof(proc));
+    memset(out_path, 0, sizeof(out_path));
+    run = mcp_run_shell_command_cancellable(srv, status_cmd, out_path, &proc);
+    cancelled = proc.cancellation_requested || mcp_request_cancelled(srv);
+    opened = false;
+    fp = (!cancelled && run == 0 && proc.exit_code == 0) ? cbm_fopen(out_path, "rb") : NULL;
+    opened = fp != NULL;
+    if (fp) {
+        for (;;) {
+            bool rec_terminated = false;
+            char *record = detect_read_record(fp, '\0', &path_oom, &rec_terminated);
+            if (!record) {
+                break;
+            }
+            size_t length = strlen(record);
+            bool typed = rec_terminated && length > PAIR_LEN + 1U && record[PAIR_LEN] == ' ';
+            bool rename_or_copy = typed && (record[0] == 'R' || record[0] == 'C' ||
+                                            record[1] == 'R' || record[1] == 'C');
+            if (!typed) {
+                path_malformed = true;
+                free(record);
+                break;
+            }
+            const char *rel = detect_project_relative_path(record + PAIR_LEN + 1U, git_prefix);
+            if (rel && rel[0]) {
+                char prefixed[CBM_SZ_1K];
+                const char *final_path = rel;
+                if (repo->rel[0]) {
+                    int pn = snprintf(prefixed, sizeof(prefixed), "%s/%s", repo->rel, rel);
+                    if (pn > 0 && pn < (int)sizeof(prefixed)) {
+                        final_path = prefixed;
+                    }
+                }
+                if (!detect_add_changed_path(&lfiles, &lcount, &lcap, final_path)) {
+                    path_oom = true;
+                    free(record);
+                    break;
+                }
+            }
+            free(record);
+            if (rename_or_copy) {
+                bool source_terminated = false;
+                char *source =
+                    detect_read_record(fp, '\0', &path_oom, &source_terminated);
+                if (!source || !source_terminated || !source[0]) {
+                    free(source);
+                    path_malformed = !path_oom;
+                    break;
+                }
+                free(source);
+            }
+        }
+        (void)fclose(fp);
+    }
+    if (out_path[0]) {
+        (void)cbm_unlink(out_path);
+    }
+    if (cancelled) {
+        for (int i = 0; i < lcount; i++) {
+            free(lfiles[i]);
+        }
+        free(lfiles);
+        return 2;
+    }
+    if (run != 0 || proc.exit_code != 0 || !opened || path_oom || path_malformed) {
+        for (int i = 0; i < lcount; i++) {
+            free(lfiles[i]);
+        }
+        free(lfiles);
+        return -1;
+    }
+
+    /* Hunks (best-effort; a failure only drops line scoping for this repo). */
+    if (want_symbols) {
+        enum { DETECT_NESTED_HUNK_CAP = 4096 };
+        char hunk_cmd[CBM_SZ_4K];
+        snprintf(hunk_cmd, sizeof(hunk_cmd),
+                 "git -C '%s' diff --relative --unified=0 '%s' '%s' -- 2>/dev/null && "
+                 "git -C '%s' diff --relative --unified=0 -- 2>/dev/null",
+                 repo->abs, merge_base, head_oid, repo->abs);
+        memset(&proc, 0, sizeof(proc));
+        memset(out_path, 0, sizeof(out_path));
+        int hunk_run = mcp_run_shell_command_cancellable(srv, hunk_cmd, out_path, &proc);
+        bool hunk_cancelled = proc.cancellation_requested || mcp_request_cancelled(srv);
+        FILE *hfp = (!hunk_cancelled && hunk_run == 0 && proc.exit_code == 0)
+                        ? cbm_fopen(out_path, "rb")
+                        : NULL;
+        if (hfp) {
+            (void)fseek(hfp, 0, SEEK_END);
+            long hsz = ftell(hfp);
+            if (hsz > 0) {
+                (void)fseek(hfp, 0, SEEK_SET);
+                char *hbuf = malloc((size_t)hsz + SKIP_ONE);
+                if (hbuf) {
+                    size_t hread = fread(hbuf, SKIP_ONE, (size_t)hsz, hfp);
+                    hbuf[hread] = '\0';
+                    cbm_changed_hunk_t *lhunks =
+                        safe_realloc(NULL, (size_t)DETECT_NESTED_HUNK_CAP * sizeof(*lhunks));
+                    if (lhunks) {
+                        int lhcount = cbm_parse_hunks(hbuf, lhunks, DETECT_NESTED_HUNK_CAP);
+                        if (lhcount < DETECT_NESTED_HUNK_CAP) {
+                            for (int i = 0; i < lhcount; i++) {
+                                char prefixed[CBM_SZ_512];
+                                int pn = snprintf(prefixed, sizeof(prefixed), "%s/%s", repo->rel,
+                                                  lhunks[i].path);
+                                if (pn > 0 && pn < (int)sizeof(prefixed)) {
+                                    memcpy(lhunks[i].path, prefixed, (size_t)pn + 1U);
+                                }
+                            }
+                            if (lhcount > 0) {
+                                cbm_changed_hunk_t *grown = safe_realloc(
+                                    *hunks, ((size_t)*hunk_count + (size_t)lhcount) *
+                                                sizeof(**hunks));
+                                if (grown) {
+                                    memcpy(grown + *hunk_count, lhunks,
+                                           (size_t)lhcount * sizeof(**hunks));
+                                    *hunks = grown;
+                                    *hunk_count += lhcount;
+                                }
+                            }
+                        }
+                        free(lhunks);
+                    }
+                    free(hbuf);
+                }
+            }
+            (void)fclose(hfp);
+        }
+        if (out_path[0]) {
+            (void)cbm_unlink(out_path);
+        }
+        if (hunk_cancelled) {
+            for (int i = 0; i < lcount; i++) {
+                free(lfiles[i]);
+            }
+            free(lfiles);
+            return 2;
+        }
+    }
+
+    /* Success: merge the local paths into the caller's array. */
+    for (int i = 0; i < lcount; i++) {
+        if (!detect_add_changed_path(files, file_count, file_cap, lfiles[i])) {
+            for (int j = i; j < lcount; j++) {
+                free(lfiles[j]);
+            }
+            free(lfiles);
+            return -1;
+        }
+        free(lfiles[i]);
+    }
+    free(lfiles);
+    repo->head = strdup(head_oid);
+    repo->merge_base = strdup(merge_base);
+    repo->included = true;
+    return 0;
 }
 
 static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
@@ -16640,6 +17075,85 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         qsort(files, (size_t)file_count, sizeof(*files), detect_changed_path_compare);
     }
 
+    /* Nested repositories: union their changed paths and line hunks into the
+     * same project-relative coordinates. A repo whose base_branch does not
+     * resolve is skipped with a warning; the primary repo keeps its hard-error
+     * behavior, so a broken primary request never looks like an empty diff. */
+    cbm_changed_hunk_t *hunks = NULL;
+    int hunk_count = 0;
+    detect_nested_repo_t *nested_repos = NULL;
+    int nested_count = 0;
+    char **detect_warnings = NULL;
+    int detect_warning_count = 0;
+    char *extra_revisions = NULL;
+    nested_repos = detect_load_nested_repos(store, project, root_path, &nested_count);
+    for (int ri = 0; nested_repos && ri < nested_count; ri++) {
+        char warn[CBM_SZ_512] = "";
+        int nrc = detect_collect_nested_repo(srv, &nested_repos[ri], base_branch, want_symbols,
+                                             &files, &file_count, &file_cap, &hunks, &hunk_count,
+                                             warn, sizeof(warn));
+        if (nrc == 2) {
+            for (int i = 0; i < file_count; i++) {
+                free(files[i]);
+            }
+            free(files);
+            free(hunks);
+            detect_nested_repos_free(nested_repos, nested_count);
+            free(direction);
+            free(root_path);
+            free(project);
+            free(base_branch);
+            free(scope);
+            return cbm_mcp_text_result("detect_changes cancelled for this request", true);
+        }
+        if (nrc != 0) {
+            if (!warn[0]) {
+                snprintf(warn, sizeof(warn), "nested repository %s: change collection failed",
+                         nested_repos[ri].rel);
+            }
+            char **grown = safe_realloc(detect_warnings,
+                                        ((size_t)detect_warning_count + 1U) * sizeof(*grown));
+            if (grown) {
+                detect_warnings = grown;
+                detect_warnings[detect_warning_count] = strdup(warn);
+                if (detect_warnings[detect_warning_count]) {
+                    detect_warning_count++;
+                }
+            }
+            nested_repos[ri].included = false;
+        }
+    }
+    if (nested_count > 0) {
+        size_t need = 1U;
+        for (int ri = 0; ri < nested_count; ri++) {
+            if (!nested_repos[ri].included) {
+                continue;
+            }
+            need += strlen(nested_repos[ri].rel) +
+                    (nested_repos[ri].head ? strlen(nested_repos[ri].head) : 0) +
+                    (nested_repos[ri].merge_base ? strlen(nested_repos[ri].merge_base) : 0) + 8U;
+        }
+        extra_revisions = calloc(need, 1);
+        if (extra_revisions) {
+            size_t off = 0;
+            for (int ri = 0; ri < nested_count; ri++) {
+                if (!nested_repos[ri].included) {
+                    continue;
+                }
+                int wrote = snprintf(extra_revisions + off, need - off, "%s%s=%s,%s",
+                                     off ? ";" : "", nested_repos[ri].rel,
+                                     nested_repos[ri].head ? nested_repos[ri].head : "",
+                                     nested_repos[ri].merge_base ? nested_repos[ri].merge_base : "");
+                if (wrote > 0 && (size_t)wrote < need - off) {
+                    off += (size_t)wrote;
+                }
+            }
+        }
+    }
+    if (file_count > 1) {
+        qsort(files, (size_t)file_count, sizeof(*files), detect_changed_path_compare);
+    }
+
     /* Per-symbol impact page size. Engine saturation makes the reported total
      * an explicit lower bound, while impact_offset continues every materialized
      * row without identifier truncation. */
@@ -16708,8 +17222,6 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
      * miss reverts to whole-file seeding rather than dropping out.
      * --relative keeps hunk paths in the same project-relative coordinates as
      * `files` when the project root is a repository subdirectory (#1951). */
-    cbm_changed_hunk_t *hunks = NULL;
-    int hunk_count = 0;
     if (want_symbols) {
         char hunk_cmd[CBM_SZ_2K];
 #ifdef _WIN32
@@ -16741,14 +17253,20 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
                     size_t hread = fread(hbuf, SKIP_ONE, (size_t)hsz, hfp);
                     hbuf[hread] = '\0';
                     enum { HUNK_CAP = 4096 };
-                    hunks = safe_realloc(NULL, (size_t)HUNK_CAP * sizeof(cbm_changed_hunk_t));
-                    hunk_count = cbm_parse_hunks(hbuf, hunks, HUNK_CAP);
+                    int parsed = 0;
+                    cbm_changed_hunk_t *grown = safe_realloc(
+                        hunks, ((size_t)hunk_count + HUNK_CAP) * sizeof(*grown));
+                    if (grown) {
+                        hunks = grown;
+                        parsed = cbm_parse_hunks(hbuf, hunks + hunk_count, HUNK_CAP);
+                        hunk_count += parsed;
+                    }
                     /* A filled buffer means the diff was truncated: the hunks
                      * past the cap are gone, so files captured only partially
                      * would still look scoped and silently under-seed. Drop
                      * scoping for the whole request rather than under-report a
                      * large refactor — whole-file seeding is the safe side. */
-                    if (hunk_count >= HUNK_CAP) {
+                    if (parsed >= HUNK_CAP) {
                         cbm_log_info("detect_changes.hunks", "action", "scoping_disabled", "reason",
                                      "hunk_cap_reached");
                         free(hunks);
@@ -16796,8 +17314,8 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
     const char *cursor_error = NULL;
     char detect_snapshot[33] = "";
     bool detect_snapshot_complete = detect_snapshot_fingerprint(
-        srv, root_path, head_oid, base_oid, merge_base, generation, files, file_count, &impact,
-        modules, nmods, module_overflow, detect_snapshot);
+        srv, root_path, head_oid, base_oid, merge_base, extra_revisions, generation, files,
+        file_count, &impact, modules, nmods, module_overflow, detect_snapshot);
 
     detect_cursor_t decoded_cursor = {0};
     bool cursor_supplied = (changed_cursor_arg && changed_cursor_arg[0]) ||
@@ -16852,6 +17370,12 @@ static char *handle_detect_changes(cbm_mcp_server_t *srv, const char *args) {
         free(files);
         free(seeds);
         free(hunks);
+        detect_nested_repos_free(nested_repos, nested_count);
+        for (int i = 0; i < detect_warning_count; i++) {
+            free(detect_warnings[i]);
+        }
+        free(detect_warnings);
+        free(extra_revisions);
         free(impact_cursor_arg);
         free(changed_cursor_arg);
         free(module_cursor_arg);
@@ -16896,6 +17420,44 @@ render_detect_output:;
         cbm_tree_scalar_str(&sb, "base", base_branch);
         if (merge_base[0]) {
             cbm_tree_scalar_str(&sb, "merge_base", merge_base);
+        }
+        if (nested_count > 0) {
+            int shown = 0;
+            for (int ri = 0; ri < nested_count; ri++) {
+                if (nested_repos[ri].included) {
+                    shown++;
+                }
+            }
+            static const char *const repo_columns[] = {"path", "head", "merge_base"};
+            const char **repo_cells =
+                shown > 0 ? calloc((size_t)shown * 3U, sizeof(*repo_cells)) : NULL;
+            if (shown == 0 || repo_cells) {
+                int row = 0;
+                for (int ri = 0; ri < nested_count; ri++) {
+                    if (!nested_repos[ri].included) {
+                        continue;
+                    }
+                    repo_cells[(size_t)row * 3U] = nested_repos[ri].rel;
+                    repo_cells[(size_t)row * 3U + 1U] =
+                        nested_repos[ri].head ? nested_repos[ri].head : "";
+                    repo_cells[(size_t)row * 3U + 2U] =
+                        nested_repos[ri].merge_base ? nested_repos[ri].merge_base : "";
+                    row++;
+                }
+                static const bool repo_string_cols[] = {true, true, true};
+                static const bool repo_prefix_cols[] = {true, false, false};
+                cbm_tree_table_rows_profiled(&sb, "repos", shown, repo_columns, 3, repo_cells,
+                                             repo_string_cols, repo_prefix_cols);
+            } else {
+                cbm_tree_table_header(&sb, "repos", 0, repo_columns, 3);
+                cbm_tree_scalar_str(&sb, "repos_render_error", "out_of_memory");
+            }
+            free(repo_cells);
+        }
+        if (detect_warning_count > 0) {
+            static const char *const warning_columns[] = {"warning"};
+            cbm_tree_table_rows(&sb, "warnings", detect_warning_count, warning_columns, 1,
+                                (const char *const *)detect_warnings);
         }
         cbm_tree_scalar_str(&sb, "direction", direction);
         if (output_budget_hit) {
@@ -17019,6 +17581,31 @@ render_detect_output:;
         yyjson_mut_obj_add_strcpy(doc, root_obj, "base", base_branch);
         if (merge_base[0]) {
             yyjson_mut_obj_add_strcpy(doc, root_obj, "merge_base", merge_base);
+        }
+        if (nested_count > 0) {
+            yyjson_mut_val *repos = yyjson_mut_arr(doc);
+            for (int ri = 0; ri < nested_count; ri++) {
+                if (!nested_repos[ri].included) {
+                    continue;
+                }
+                yyjson_mut_val *ro = yyjson_mut_obj(doc);
+                yyjson_mut_obj_add_strcpy(doc, ro, "path", nested_repos[ri].rel);
+                yyjson_mut_obj_add_strcpy(doc, ro, "head",
+                                          nested_repos[ri].head ? nested_repos[ri].head : "");
+                yyjson_mut_obj_add_strcpy(doc, ro, "merge_base",
+                                          nested_repos[ri].merge_base
+                                              ? nested_repos[ri].merge_base
+                                              : "");
+                yyjson_mut_arr_add_val(repos, ro);
+            }
+            yyjson_mut_obj_add_val(doc, root_obj, "repos", repos);
+        }
+        if (detect_warning_count > 0) {
+            yyjson_mut_val *warnings = yyjson_mut_arr(doc);
+            for (int i = 0; i < detect_warning_count; i++) {
+                yyjson_mut_arr_add_strcpy(doc, warnings, detect_warnings[i]);
+            }
+            yyjson_mut_obj_add_val(doc, root_obj, "warnings", warnings);
         }
         yyjson_mut_obj_add_strcpy(doc, root_obj, "direction", direction);
         if (output_budget_hit) {
@@ -17202,6 +17789,12 @@ detect_output_done:
     free(files);
     free(seeds);
     free(hunks);
+    detect_nested_repos_free(nested_repos, nested_count);
+    for (int i = 0; i < detect_warning_count; i++) {
+        free(detect_warnings[i]);
+    }
+    free(detect_warnings);
+    free(extra_revisions);
     free(impact_cursor_arg);
     free(changed_cursor_arg);
     free(module_cursor_arg);

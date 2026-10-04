@@ -14513,6 +14513,182 @@ TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed) {
     PASS();
 }
 
+/* Phase 4 (nested repositories): a module checked out under the project root
+ * with its own .git (AzerothCore's modules/mod-playerbots shape) contributes
+ * changed paths and impact seeds to the SAME detect_changes call. The index
+ * records the repo root as a Branch node with "nested":true + "repo_rel"; a
+ * nested repo the base branch cannot resolve is skipped with a warning. */
+TEST(tool_detect_changes_unions_nested_repository) {
+    char repo[CBM_SZ_4K];
+    snprintf(repo, sizeof(repo), "%s/cbm-detect-nested-repo-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(repo));
+    char cache[CBM_SZ_4K];
+    snprintf(cache, sizeof(cache), "%s/cbm-detect-nested-cache-XXXXXX", cbm_tmpdir());
+    ASSERT_NOT_NULL(cbm_mkdtemp(cache));
+
+    const char *const init_args[] = {"init", "-q", NULL};
+    const char *const add_args[] = {"add", "-A", NULL};
+    const char *const commit_args[] = {
+        "-c",     "user.name=cbm-test",
+        "-c",     "user.email=cbm-test@example.invalid",
+        "-c",     "commit.gpgsign=false",
+        "commit", "-q",
+        "-m",     "fixture",
+        NULL,
+    };
+    ASSERT_EQ(mcp_test_git(repo, init_args), 0);
+    char root_src[CBM_SZ_4K];
+    snprintf(root_src, sizeof(root_src), "%s/root.c", repo);
+    ASSERT_EQ(th_write_file(root_src, "int root_seed(void) { return 1; }\n"), 0);
+    ASSERT_EQ(mcp_test_git(repo, add_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, commit_args), 0);
+
+    /* A module with its own repository and one committed file. */
+    char modules_dir[CBM_SZ_4K];
+    snprintf(modules_dir, sizeof(modules_dir), "%s/modules", repo);
+    ASSERT_EQ(cbm_mkdir(modules_dir), 0);
+    char nested_dir[CBM_SZ_4K];
+    snprintf(nested_dir, sizeof(nested_dir), "%s/modules/mod-playerbots", repo);
+    ASSERT_EQ(cbm_mkdir(nested_dir), 0);
+    char nested_src_dir[CBM_SZ_4K];
+    snprintf(nested_src_dir, sizeof(nested_src_dir), "%s/src", nested_dir);
+    ASSERT_EQ(cbm_mkdir(nested_src_dir), 0);
+    char nested_src[CBM_SZ_4K];
+    snprintf(nested_src, sizeof(nested_src), "%s/x.c", nested_src_dir);
+    ASSERT_EQ(th_write_file(nested_src, "int nested_seed(void) { return 2; }\n"), 0);
+    ASSERT_EQ(mcp_test_git(nested_dir, init_args), 0);
+    ASSERT_EQ(mcp_test_git(nested_dir, add_args), 0);
+    ASSERT_EQ(mcp_test_git(nested_dir, commit_args), 0);
+    /* The only worktree change: an uncommitted edit in the nested repo. */
+    ASSERT_EQ(th_write_file(nested_src, "int nested_seed(void) { return 3; }\n"), 0);
+
+    /* Record the module in the outer repo as a gitlink (so outer status stays
+     * clean) and create a branch the nested repo does not have: the skip case
+     * needs a base that resolves in the primary repository only. */
+    ASSERT_EQ(mcp_test_git(repo, add_args), 0);
+    ASSERT_EQ(mcp_test_git(repo, commit_args), 0);
+    const char *const branch_args[] = {"branch", "outer-only", NULL};
+    ASSERT_EQ(mcp_test_git(repo, branch_args), 0);
+
+    const char *saved_cache = getenv("CBM_CACHE_DIR");
+    char *saved_cache_copy = saved_cache ? strdup(saved_cache) : NULL;
+    ASSERT_EQ(cbm_setenv("CBM_CACHE_DIR", cache, 1), 0);
+    cbm_mcp_server_t *srv = cbm_mcp_server_new(NULL);
+    ASSERT_NOT_NULL(srv);
+    cbm_store_t *store = cbm_mcp_server_store(srv);
+    ASSERT_NOT_NULL(store);
+    const char *project = "detect-nested-repo-project";
+    ASSERT_EQ(cbm_store_upsert_project(store, project, repo), CBM_STORE_OK);
+    cbm_mcp_server_set_project(srv, project);
+
+    cbm_node_t seed = {.project = project,
+                       .label = "Function",
+                       .name = "nested_seed",
+                       .qualified_name = "fixture.nested_seed",
+                       .file_path = "modules/mod-playerbots/src/x.c",
+                       .start_line = 1,
+                       .end_line = 1};
+    int64_t seed_id = cbm_store_upsert_node(store, &seed);
+    ASSERT_GT(seed_id, 0);
+    cbm_node_t caller = {.project = project,
+                         .label = "Function",
+                         .name = "nested_caller",
+                         .qualified_name = "fixture.nested_caller",
+                         .file_path = "caller.c",
+                         .start_line = 1,
+                         .end_line = 1};
+    int64_t caller_id = cbm_store_upsert_node(store, &caller);
+    ASSERT_GT(caller_id, 0);
+    cbm_edge_t edge = {
+        .project = project, .source_id = caller_id, .target_id = seed_id, .type = "CALLS"};
+    ASSERT_GT(cbm_store_insert_edge(store, &edge), 0);
+
+    cbm_node_t nested_branch = {
+        .project = project,
+        .label = "Branch",
+        .name = "master",
+        .qualified_name = "fixture.modules.mod-playerbots.__repo__",
+        .properties_json = "{\"nested\":true,\"repo_rel\":\"modules/mod-playerbots\"}"};
+    ASSERT_GT(cbm_store_upsert_node(store, &nested_branch), 0);
+
+    /* Base "outer-only" resolves in the primary repo, not in the nested one:
+     * the nested repo is skipped with a warning and contributes no paths. */
+    char *response = cbm_mcp_handle_tool(
+        srv, "detect_changes",
+        "{\"project\":\"detect-nested-repo-project\",\"base_branch\":\"outer-only\","
+        "\"scope\":\"impact\",\"depth\":1,\"max_output_tokens\":10000,"
+        "\"format\":\"json\"}");
+    char *inner = extract_text_content(response);
+    yyjson_doc *doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    yyjson_val *root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *warnings = root ? yyjson_obj_get(root, "warnings") : NULL;
+    bool skip_warned = warnings && yyjson_arr_size(warnings) == 1 &&
+                       strstr(yyjson_get_str(yyjson_arr_get(warnings, 0)), "mod-playerbots") != NULL;
+    /* The dirty gitlink itself may appear as an outer-repo status row, but the
+     * nested repo's own path must be absent when its base was skipped. */
+    bool skip_has_nested = false;
+    yyjson_val *skip_changed = root ? yyjson_obj_get(root, "changed_files") : NULL;
+    if (skip_changed) {
+        for (size_t i = 0; i < yyjson_arr_size(skip_changed); i++) {
+            const char *p = yyjson_get_str(yyjson_arr_get(skip_changed, i));
+            if (p && strcmp(p, "modules/mod-playerbots/src/x.c") == 0) {
+                skip_has_nested = true;
+            }
+        }
+    }
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+
+    /* Base HEAD resolves in both repositories: the nested worktree edit lands
+     * in the same call, with its repo row and impact seed. */
+    response = cbm_mcp_handle_tool(
+        srv, "detect_changes",
+        "{\"project\":\"detect-nested-repo-project\",\"base_branch\":\"HEAD\","
+        "\"scope\":\"impact\",\"depth\":1,\"max_output_tokens\":10000,"
+        "\"format\":\"json\"}");
+    inner = extract_text_content(response);
+    doc = inner ? yyjson_read(inner, strlen(inner), 0) : NULL;
+    root = doc ? yyjson_doc_get_root(doc) : NULL;
+    yyjson_val *changed_files = root ? yyjson_obj_get(root, "changed_files") : NULL;
+    yyjson_val *impacted = root ? yyjson_obj_get(root, "impacted") : NULL;
+    yyjson_val *first_impact = impacted ? yyjson_arr_get(impacted, 0) : NULL;
+    yyjson_val *repos = root ? yyjson_obj_get(root, "repos") : NULL;
+    bool union_has_nested = false;
+    if (changed_files) {
+        for (size_t i = 0; i < yyjson_arr_size(changed_files); i++) {
+            const char *p = yyjson_get_str(yyjson_arr_get(changed_files, i));
+            if (p && strcmp(p, "modules/mod-playerbots/src/x.c") == 0) {
+                union_has_nested = true;
+            }
+        }
+    }
+    bool seed_found = root && yyjson_get_int(yyjson_obj_get(root, "seed_symbols")) == 1;
+    bool impact_found = first_impact &&
+                        strcmp(yyjson_get_str(yyjson_obj_get(first_impact, "qn")),
+                               "fixture.nested_caller") == 0;
+    bool repo_row = repos && yyjson_arr_size(repos) == 1 &&
+                    strcmp(yyjson_get_str(yyjson_obj_get(yyjson_arr_get(repos, 0), "path")),
+                           "modules/mod-playerbots") == 0;
+
+    yyjson_doc_free(doc);
+    free(inner);
+    free(response);
+    cbm_mcp_server_free(srv);
+    restore_cache_dir(saved_cache_copy);
+    free(saved_cache_copy);
+    ASSERT_EQ(th_rmtree(cache), 0);
+    ASSERT_EQ(th_rmtree(repo), 0);
+
+    ASSERT_TRUE(union_has_nested);
+    ASSERT_TRUE(seed_found);
+    ASSERT_TRUE(impact_found);
+    ASSERT_TRUE(repo_row);
+    ASSERT_TRUE(skip_warned);
+    ASSERT_FALSE(skip_has_nested);
+    PASS();
+}
+
 /* Issue #1951: the indexed project root is a SUBDIRECTORY of a normal Git
  * repository. Git reports changed paths relative to the Git root
  * ("game/src/math.c"), while graph file_paths are relative to the project
@@ -21291,6 +21467,7 @@ SUITE(mcp) {
     RUN_TEST(tool_detect_changes_invalid_base_is_an_error);
     RUN_TEST(tool_detect_changes_preserves_utf8_git_path_and_impact_seed);
     RUN_TEST(tool_detect_changes_finds_nested_untracked_file_and_impact_seed);
+    RUN_TEST(tool_detect_changes_unions_nested_repository);
     RUN_TEST(tool_detect_changes_subdirectory_project_translates_git_root_paths_issue1951);
     RUN_TEST(tool_detect_changes_escapes_newline_path_in_tree_and_round_trips_json);
     RUN_TEST(tool_detect_changes_staged_rename_uses_exact_destination_record);

@@ -669,6 +669,74 @@ static void free_seen_dir_key(const char *key, void *val, void *ud) {
     free((void *)key);
 }
 
+/* ── Nested repositories ─────────────────────────────────────────── */
+
+/* A subdirectory carrying its own .git is a separate change source for
+ * detect_changes (AzerothCore's gitignored-then-rescued modules/mod-playerbots
+ * is the canonical case). Record one Branch node per such directory with
+ * "nested":true + "repo_rel" so the tool can union its diff without walking
+ * the tree again. Only directories that contributed indexed files are
+ * scanned: ignored trees never reach seen_dirs. */
+
+typedef struct {
+    cbm_pipeline_t *p;
+    const cbm_gbuf_node_t *project_node;
+    int found;
+} nested_repo_scan_t;
+
+static void scan_nested_repo(const char *dir, void *val, void *ud) {
+    (void)val;
+    nested_repo_scan_t *scan = (nested_repo_scan_t *)ud;
+    if (!dir || !dir[0]) {
+        return; /* the project root's own repo is the primary Branch node */
+    }
+    char dot_git[CBM_SZ_4K];
+    int n = snprintf(dot_git, sizeof(dot_git), "%s/%s/.git", scan->p->repo_path, dir);
+    if (n <= 0 || n >= (int)sizeof(dot_git)) {
+        return;
+    }
+    struct stat st;
+    if (stat(dot_git, &st) != 0) {
+        return;
+    }
+    char abs_repo[CBM_SZ_4K];
+    n = snprintf(abs_repo, sizeof(abs_repo), "%s/%s", scan->p->repo_path, dir);
+    if (n <= 0 || n >= (int)sizeof(abs_repo)) {
+        return;
+    }
+    cbm_git_context_t gctx;
+    memset(&gctx, 0, sizeof(gctx));
+    if (cbm_git_context_resolve(abs_repo, &gctx) != 0 || !gctx.is_git) {
+        cbm_git_context_free(&gctx);
+        return;
+    }
+    char base_props[CBM_SZ_2K];
+    int props_len = cbm_git_context_props_json(&gctx, base_props, sizeof(base_props));
+    if (props_len <= 0 || base_props[props_len - 1] != '}') {
+        cbm_git_context_free(&gctx);
+        return;
+    }
+    char esc_rel[CBM_SZ_1K];
+    cbm_json_escape(esc_rel, sizeof(esc_rel), dir);
+    char props[CBM_SZ_4K];
+    int pn = snprintf(props, sizeof(props), "%.*s,\"nested\":true,\"repo_rel\":\"%s\"}",
+                      props_len - 1, base_props, esc_rel);
+    if (pn <= 0 || pn >= (int)sizeof(props)) {
+        cbm_git_context_free(&gctx);
+        return;
+    }
+    char *qn = cbm_pipeline_fqn_compute(scan->p->project_name, dir, "__repo__");
+    const char *branch_name = gctx.branch ? gctx.branch : dir;
+    int64_t node_id =
+        cbm_gbuf_upsert_node(scan->p->gbuf, "Branch", branch_name, qn, NULL, 0, 0, props);
+    if (node_id > 0 && scan->project_node) {
+        cbm_gbuf_insert_edge(scan->p->gbuf, scan->project_node->id, node_id, "HAS_BRANCH", props);
+    }
+    free(qn);
+    cbm_git_context_free(&gctx);
+    scan->found++;
+}
+
 /* ── Pass 1: Structure ──────────────────────────────────────────── */
 
 /* Create Project, Folder/Package, and File nodes in the graph buffer. */
@@ -795,6 +863,18 @@ static int pass_structure(cbm_pipeline_t *p, const cbm_file_info_t *files, int f
         free(file_qn);
         free(dir);
         free(parent_qn_heap);
+    }
+
+    /* Persist nested repository roots for detect_changes (see scan_nested_repo
+     * above) while the directory set from the indexed files is still live. */
+    nested_repo_scan_t repo_scan = {
+        .p = p,
+        .project_node = cbm_gbuf_find_by_qn(p->gbuf, p->project_name),
+        .found = 0,
+    };
+    cbm_ht_foreach(seen_dirs, scan_nested_repo, &repo_scan);
+    if (repo_scan.found > 0) {
+        cbm_log_info("pass.structure.nested_repos", "count", itoa_buf(repo_scan.found));
     }
 
     /* Free seen_dirs keys */
